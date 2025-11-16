@@ -188,6 +188,16 @@ class IOUMetric:
         return acc, acc_cls, iu, mean_iu, fwavacc
 
 model = seg_dtd('',2).cuda()
+
+#解决GELU激活层缺少'approximate'属性问题
+for module in model.modules():
+    # 如果模块是 GELU 激活层
+    if isinstance(module, torch.nn.GELU):
+        # 检查它是否缺少 'approximate' 属性
+        if not hasattr(module, 'approximate'):
+            # 为它添加这个缺失的属性，并设置为默认值 'none'
+            module.approximate = 'none'
+
 model = torch.nn.DataParallel(model)
 
 def eval_net_dtd(model, test_data, plot=False,device='cuda'):
