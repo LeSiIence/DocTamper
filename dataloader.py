@@ -26,8 +26,9 @@ class DocTamperDataset(Dataset):
         with self.envs.begin(write=False) as txn:
             self.nSamples = int(txn.get('num-samples'.encode('utf-8')))
         if max_nums is None:
-            self.max_nums=self.nSamples
-        self.max_nums=min(max_nums,self.nSamples)
+            self.max_nums = self.nSamples
+        else:
+            self.max_nums = min(max_nums, self.nSamples)
         self.minq = minq # Q
         with open('qt_table.pk','rb') as fpk:
             pks = pickle.load(fpk)

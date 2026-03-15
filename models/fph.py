@@ -8,7 +8,10 @@ import torch.nn as nn
 import torch._utils
 import torch.nn.functional as F
 from functools import partial
-from timm.models.layers import trunc_normal_, DropPath
+try:
+    from timm.layers import trunc_normal_, DropPath
+except ImportError:
+    from timm.models.layers import trunc_normal_, DropPath
 import collections
 
 BlockArgs = collections.namedtuple('BlockArgs', ['num_repeat', 'kernel_size', 'stride', 'expand_ratio','input_filters', 'output_filters', 'se_ratio', 'id_skip'])
