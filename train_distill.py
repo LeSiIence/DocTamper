@@ -38,6 +38,21 @@ def _load_teacher_state_dict(teacher, ckpt_path):
     teacher.load_state_dict(best_state, strict=True)
 
 
+def _load_student_state_dict(student, raw_state):
+    """
+    兼容 DataParallel/非 DataParallel 的学生权重加载。
+    """
+    model_keys = set(student.state_dict().keys())
+    candidates = [
+        raw_state,
+        _strip_prefix_from_state_dict(raw_state, 'module.'),
+        _strip_prefix_from_state_dict(raw_state, 'model.'),
+        _strip_prefix_from_state_dict(_strip_prefix_from_state_dict(raw_state, 'module.'), 'model.'),
+    ]
+    best_state = max(candidates, key=lambda s: len(model_keys.intersection(s.keys())))
+    student.load_state_dict(best_state, strict=True)
+
+
 def _patch_legacy_gelu(module):
     """
     兼容旧权重/旧序列化对象中 GELU 缺失 approximate 属性的问题。
@@ -84,6 +99,7 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--save_dir', type=str, default='pths')
     parser.add_argument('--save_interval', type=int, default=5)
+    parser.add_argument('--resume', type=str, default='', help='断点续训 checkpoint 路径')
     return parser.parse_args()
 
 
@@ -250,8 +266,22 @@ def main():
     criterion = build_criterion(args).to(device)
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, student.parameters()), lr=args.lr)
     scaler = GradScaler()
+    start_epoch = 1
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location='cpu')
+        student_state = resume_ckpt.get('student_state', resume_ckpt.get('state_dict', None))
+        if student_state is None:
+            raise KeyError(f"Checkpoint {args.resume} does not contain student_state/state_dict.")
+        _load_student_state_dict(student, student_state)
+        if 'optimizer' in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt['optimizer'])
+        if 'scaler' in resume_ckpt:
+            scaler.load_state_dict(resume_ckpt['scaler'])
+        start_epoch = int(resume_ckpt.get('epoch', 0)) + 1
+        print(f"Resume training from epoch {start_epoch} with checkpoint: {args.resume}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         loss, hard, soft, feat = train_one_epoch(
             epoch,
             teacher,
@@ -271,6 +301,7 @@ def main():
                 'epoch': epoch,
                 'student_state': student.module.state_dict() if isinstance(student, nn.DataParallel) else student.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
             }
             torch.save(state, save_path)
             print(f'Saved student checkpoint to {save_path}')

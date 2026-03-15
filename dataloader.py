@@ -7,6 +7,7 @@ import tempfile
 import numpy as np
 import pickle
 import six
+import warnings
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 import albumentations as A
@@ -74,80 +75,89 @@ class DocTamperDataset(Dataset):
         return self.max_nums
 
     def __getitem__(self, index):
-        with self.envs.begin(write=False) as txn:
-            img_key = 'image-%09d' % index
-            imgbuf = txn.get(img_key.encode('utf-8'))
-            buf = six.BytesIO()
-            buf.write(imgbuf)
-            buf.seek(0)
-            im = Image.open(buf)
-            lbl_key = 'label-%09d' % index
-            lblbuf = txn.get(lbl_key.encode('utf-8'))
-            mask = (cv2.imdecode(np.frombuffer(lblbuf,dtype=np.uint8),0)!=0).astype(np.uint8)
-            record = self.record[index]
-            choicei = len(record)-1
-            q = int(record[-1])
-            if True:
-                use_qtb = self.pks[q]
-                if choicei>1:
-                    q2 = int(record[-3])
-                    use_qtb2 = self.pks[q2]
-                if choicei>0:
-                    q1 = int(record[-2])
-                    use_qtb1 = self.pks[q1]
+        # 针对偶发坏样本（JPEG 结构异常等）做容错重试，避免 DataLoader worker 直接崩溃
+        for retry in range(3):
+            cur_index = (index + retry) % self.max_nums
+            try:
+                with self.envs.begin(write=False) as txn:
+                    img_key = 'image-%09d' % cur_index
+                    imgbuf = txn.get(img_key.encode('utf-8'))
+                    lbl_key = 'label-%09d' % cur_index
+                    lblbuf = txn.get(lbl_key.encode('utf-8'))
+                    if imgbuf is None or lblbuf is None:
+                        raise RuntimeError(f'Missing lmdb entry at index={cur_index}')
 
-            # 统一调整 mask 到 512x512，并转为张量
-            mask_resized = cv2.resize(mask, (512, 512), interpolation=cv2.INTER_NEAREST)
-            mask_tensor = self.totsr(image=mask_resized.copy())['image']
+                    buf = six.BytesIO()
+                    buf.write(imgbuf)
+                    buf.seek(0)
+                    im = Image.open(buf).convert('RGB')
+                    mask = (cv2.imdecode(np.frombuffer(lblbuf, dtype=np.uint8), 0) != 0).astype(np.uint8)
+                    record = self.record[cur_index]
+                    choicei = len(record) - 1
+                    q = int(record[-1])
+                    use_qtb = self.pks[q]
+                    q_seq = []
+                    if choicei > 1:
+                        q2 = int(record[-3])
+                        q_seq.append(q2)
+                    if choicei > 0:
+                        q1 = int(record[-2])
+                        q_seq.append(q1)
+                    q_seq.append(q)
 
-            # ---------- 干净图像的 DCT 提取（保持原逻辑） ----------
-            with tempfile.NamedTemporaryFile(delete=True) as tmp:
-                im_gray = im.convert("L")
-                if True:
-                    if choicei>1:
-                        im_gray.save(tmp, "JPEG", quality=q2)
-                        im_gray = Image.open(tmp)
-                    if choicei>0:
-                        im_gray.save(tmp, "JPEG", quality=q1)
-                        im_gray = Image.open(tmp)
-                    im_gray.save(tmp, "JPEG", quality=q)
-                jpg_clean = jpegio.read(tmp.name)
-                dct_clean = jpg_clean.coef_arrays[0].copy()
-                im_clean_rgb = im_gray.convert('RGB')
+                    # 统一调整 mask 到 512x512，并转为张量
+                    mask_resized = cv2.resize(mask, (512, 512), interpolation=cv2.INTER_NEAREST)
+                    mask_tensor = self.totsr(image=mask_resized.copy())['image']
 
-            # ---------- 使用 Albumentations 生成干净 / 失真图 ----------
-            im_clean_np = np.array(im_clean_rgb)
-            clean_aug = self.clean_transform(image=im_clean_np)
-            img_clean = clean_aug['image']
+                    def _extract_dct_with_quality_chain(pil_rgb):
+                        with tempfile.NamedTemporaryFile(delete=True, suffix='.jpg') as tmp:
+                            pil_gray = pil_rgb.convert("L")
+                            for qv in q_seq:
+                                pil_gray.save(tmp.name, "JPEG", quality=qv)
+                                pil_gray = Image.open(tmp.name).copy()
+                            try:
+                                jpg = jpegio.read(tmp.name)
+                                dct = jpg.coef_arrays[0].copy()
+                            except Exception as exc:
+                                warnings.warn(
+                                    f'jpegio read failed at index={cur_index}, fallback zero DCT: {exc}',
+                                    RuntimeWarning
+                                )
+                                # fallback 维持可训练，避免 worker 崩溃
+                                dct = np.zeros((512, 512), dtype=np.float32)
+                            return dct, pil_gray.convert('RGB')
 
-            # 以干净图为基准进行失真增强
-            dist_aug = self.distort_transform(image=im_clean_np)
-            img_dist = dist_aug['image']
-            im_dist_np = dist_aug['image'].permute(1, 2, 0).cpu().numpy()
-            im_dist_np = (im_dist_np * np.array([0.229, 0.224, 0.225])[None, None, :] +
-                          np.array([0.485, 0.455, 0.406])[None, None, :])
-            im_dist_np = np.clip(im_dist_np * 255.0, 0, 255).astype(np.uint8)
-            im_dist_rgb = Image.fromarray(im_dist_np)
+                    # ---------- 干净图像 ----------
+                    dct_clean, im_clean_rgb = _extract_dct_with_quality_chain(im)
 
-            # ---------- 失真图像的 DCT 提取（沿用相同 JPEG+DCT 逻辑） ----------
-            with tempfile.NamedTemporaryFile(delete=True) as tmp2:
-                im_dist_gray = im_dist_rgb.convert("L")
-                if True:
-                    if choicei>1:
-                        im_dist_gray.save(tmp2, "JPEG", quality=q2)
-                        im_dist_gray = Image.open(tmp2)
-                    if choicei>0:
-                        im_dist_gray.save(tmp2, "JPEG", quality=q1)
-                        im_dist_gray = Image.open(tmp2)
-                    im_dist_gray.save(tmp2, "JPEG", quality=q)
-                jpg_dist = jpegio.read(tmp2.name)
-                dct_dist = jpg_dist.coef_arrays[0].copy()
+                    # ---------- 使用 Albumentations 生成干净 / 失真图 ----------
+                    im_clean_np = np.array(im_clean_rgb)
+                    clean_aug = self.clean_transform(image=im_clean_np)
+                    img_clean = clean_aug['image']
 
-            return {
-                'img_clean': img_clean,
-                'img_dist': img_dist,
-                'dct_clean': np.clip(np.abs(dct_clean), 0, 20),
-                'dct_dist': np.clip(np.abs(dct_dist), 0, 20),
-                'qtb': use_qtb,
-                'mask': mask_tensor.long(),
-            }
+                    dist_aug = self.distort_transform(image=im_clean_np)
+                    img_dist = dist_aug['image']
+                    im_dist_np = dist_aug['image'].permute(1, 2, 0).cpu().numpy()
+                    im_dist_np = (im_dist_np * np.array([0.229, 0.224, 0.225])[None, None, :] +
+                                  np.array([0.485, 0.455, 0.406])[None, None, :])
+                    im_dist_np = np.clip(im_dist_np * 255.0, 0, 255).astype(np.uint8)
+                    im_dist_rgb = Image.fromarray(im_dist_np)
+
+                    # ---------- 失真图像 ----------
+                    dct_dist, _ = _extract_dct_with_quality_chain(im_dist_rgb)
+
+                    return {
+                        'img_clean': img_clean,
+                        'img_dist': img_dist,
+                        'dct_clean': np.clip(np.abs(dct_clean), 0, 20),
+                        'dct_dist': np.clip(np.abs(dct_dist), 0, 20),
+                        'qtb': use_qtb,
+                        'mask': mask_tensor.long(),
+                    }
+            except Exception as exc:
+                if retry == 2:
+                    raise
+                warnings.warn(
+                    f'Bad sample at index={cur_index}, retry with next sample: {exc}',
+                    RuntimeWarning
+                )
