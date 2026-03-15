@@ -238,13 +238,27 @@ class SegmentationHead(nn.Sequential):
         activation = md.Activation(activation)
         super().__init__(conv2d, upsampling, activation)
 
+def _conv2d_relu_compat(in_channels, out_channels, kernel_size=3, padding=1):
+    """
+    兼容不同版本 segmentation_models_pytorch 的 Conv2dReLU 参数签名。
+    """
+    try:
+        return md.Conv2dReLU(
+            in_channels, out_channels, kernel_size=kernel_size, padding=padding, use_batchnorm=True
+        )
+    except TypeError:
+        # 新版可能使用 use_norm 参数
+        return md.Conv2dReLU(
+            in_channels, out_channels, kernel_size=kernel_size, padding=padding, use_norm="batchnorm"
+        )
+
 class DecoderBlock(nn.Module):
     def __init__(self,cin,cadd,cout,):
         super().__init__()
         self.cin = (cin + cadd)
         self.cout = cout
-        self.conv1 = md.Conv2dReLU(self.cin,self.cout,kernel_size=3,padding=1,use_batchnorm=True)
-        self.conv2 = md.Conv2dReLU(self.cout,self.cout,kernel_size=3,padding=1,use_batchnorm=True)
+        self.conv1 = _conv2d_relu_compat(self.cin, self.cout, kernel_size=3, padding=1)
+        self.conv2 = _conv2d_relu_compat(self.cout, self.cout, kernel_size=3, padding=1)
 
     def forward(self, x1, x2=None):
         x1 = F.interpolate(x1, scale_factor=2.0, mode="nearest")
