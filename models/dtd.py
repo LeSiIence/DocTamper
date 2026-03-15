@@ -23,7 +23,11 @@ from torch.cuda.amp import autocast
 import segmentation_models_pytorch as smp
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler#need pytorch>1.6
-from losses import DiceLoss,FocalLoss,SoftCrossEntropyLoss,LovaszLoss
+try:
+    # 兼容从 models 目录或根目录运行
+    from losses import DiceLoss, FocalLoss, SoftCrossEntropyLoss, LovaszLoss
+except ImportError:
+    from models.losses import DiceLoss, FocalLoss, SoftCrossEntropyLoss, LovaszLoss
 from fph import FPH
 import albumentations as A
 from swins import *
