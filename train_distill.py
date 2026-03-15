@@ -14,6 +14,30 @@ from models.losses import SoftBCEWithLogitsLoss, LovaszLoss
 from models.losses.distill_loss import DistillationLoss
 
 
+def _strip_prefix_from_state_dict(state_dict, prefix):
+    plen = len(prefix)
+    return {k[plen:] if k.startswith(prefix) else k: v for k, v in state_dict.items()}
+
+
+def _load_teacher_state_dict(teacher, ckpt_path):
+    ckpt = torch.load(ckpt_path, map_location='cpu')
+    raw_state = ckpt['state_dict'] if isinstance(ckpt, dict) and 'state_dict' in ckpt else ckpt
+    if not isinstance(raw_state, dict):
+        raise TypeError(f"Unsupported checkpoint format: {type(raw_state)}")
+
+    model_keys = set(teacher.state_dict().keys())
+    candidates = [
+        raw_state,
+        _strip_prefix_from_state_dict(raw_state, 'module.'),
+        _strip_prefix_from_state_dict(raw_state, 'model.'),
+        _strip_prefix_from_state_dict(_strip_prefix_from_state_dict(raw_state, 'module.'), 'model.'),
+    ]
+
+    # 选择与当前模型键重叠最多的候选，避免手工猜前缀
+    best_state = max(candidates, key=lambda s: len(model_keys.intersection(s.keys())))
+    teacher.load_state_dict(best_state, strict=True)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='./', help='根目录，包含 LMDB 与 pks 目录')
@@ -38,8 +62,7 @@ def build_models(args):
 
     # 教师模型：加载权重并冻结
     teacher = seg_dtd('', 2).to(device)
-    ckpt = torch.load(args.teacher_pth, map_location='cpu')
-    teacher.load_state_dict(ckpt['state_dict'] if 'state_dict' in ckpt else ckpt)
+    _load_teacher_state_dict(teacher, args.teacher_pth)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
