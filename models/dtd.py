@@ -28,9 +28,15 @@ try:
     from losses import DiceLoss, FocalLoss, SoftCrossEntropyLoss, LovaszLoss
 except ImportError:
     from models.losses import DiceLoss, FocalLoss, SoftCrossEntropyLoss, LovaszLoss
-from fph import FPH
+try:
+    from fph import FPH
+except ImportError:
+    from models.fph import FPH
 import albumentations as A
-from swins import *
+try:
+    from swins import *
+except ImportError:
+    from models.swins import *
 from albumentations.pytorch import ToTensorV2
 import torchvision
 import torch.nn.functional as F
