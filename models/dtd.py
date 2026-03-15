@@ -51,6 +51,12 @@ from segmentation_models_pytorch.base import SegmentationModel
 
 # 兼容历史权重中通过顶层模块名 `dtd` 序列化的对象
 sys.modules.setdefault("dtd", sys.modules[__name__])
+# 兼容历史权重中旧版 timm 模块路径
+try:
+    import timm.layers.drop as _timm_layers_drop
+    sys.modules.setdefault("timm.models.layers.drop", _timm_layers_drop)
+except Exception:
+    pass
 
 
 def _resolve_pretrained_path(filename):
