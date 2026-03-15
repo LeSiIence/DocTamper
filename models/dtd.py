@@ -40,10 +40,7 @@ except ImportError:
 from albumentations.pytorch import ToTensorV2
 import torchvision
 import torch.nn.functional as F
-try:
-    from timm.layers import trunc_normal_, DropPath
-except ImportError:
-    from timm.models.layers import trunc_normal_, DropPath
+from timm.models.layers import trunc_normal_, DropPath
 from functools import partial
 from segmentation_models_pytorch.base import modules as md
 from typing import Optional, Union, List
