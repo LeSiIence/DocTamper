@@ -45,6 +45,9 @@ def _patch_legacy_gelu(module):
     for m in module.modules():
         if isinstance(m, torch.nn.GELU) and not hasattr(m, "approximate"):
             m.approximate = "none"
+        # 兼容旧版 timm DropPath 缺失 scale_by_keep 属性
+        if m.__class__.__name__ == "DropPath" and not hasattr(m, "scale_by_keep"):
+            m.scale_by_keep = True
 
 
 def parse_args():
