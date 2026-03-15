@@ -1,5 +1,6 @@
 import argparse
 import os
+import warnings
 
 import torch
 import torch.nn as nn
@@ -98,6 +99,8 @@ def parse_args():
     parser.add_argument('--gamma', type=float, default=1.0)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--save_dir', type=str, default='pths')
+    parser.add_argument('--save_dir_drive', type=str, default='',
+                        help='可选：Google Drive 备份目录（如 /content/drive/MyDrive/DocTamper_ckpts）')
     parser.add_argument('--save_interval', type=int, default=5)
     parser.add_argument('--resume', type=str, default='', help='断点续训 checkpoint 路径')
     return parser.parse_args()
@@ -250,6 +253,8 @@ def train_one_epoch(
 def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
+    if args.save_dir_drive:
+        os.makedirs(args.save_dir_drive, exist_ok=True)
 
     # 数据集和 DataLoader
     lmdb_path = os.path.join(args.data_root, args.lmdb_name)
@@ -296,7 +301,8 @@ def main():
         print(f'Epoch {epoch}: loss={loss:.4f}, hard={hard:.4f}, soft={soft:.4f}, feat={feat:.4f}')
 
         if epoch % args.save_interval == 0:
-            save_path = os.path.join(args.save_dir, f'light_dtd_distill_epoch{epoch}.pth')
+            ckpt_name = f'light_dtd_distill_epoch{epoch}.pth'
+            save_path = os.path.join(args.save_dir, ckpt_name)
             state = {
                 'epoch': epoch,
                 'student_state': student.module.state_dict() if isinstance(student, nn.DataParallel) else student.state_dict(),
@@ -305,6 +311,16 @@ def main():
             }
             torch.save(state, save_path)
             print(f'Saved student checkpoint to {save_path}')
+            if args.save_dir_drive:
+                drive_save_path = os.path.join(args.save_dir_drive, ckpt_name)
+                try:
+                    torch.save(state, drive_save_path)
+                    print(f'Backed up checkpoint to Google Drive: {drive_save_path}')
+                except Exception as exc:
+                    warnings.warn(
+                        f'Failed to back up checkpoint to Google Drive path {drive_save_path}: {exc}',
+                        RuntimeWarning
+                    )
 
 
 if __name__ == '__main__':
