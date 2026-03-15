@@ -156,6 +156,15 @@ def train_one_epoch(
     teacher.eval()
     student.train()
 
+    # 抓取教师融合层特征（与学生 adapt 后特征对齐）
+    teacher_feat_cache = {'feat': None}
+    teacher_fu = teacher.module.model.FU if isinstance(teacher, nn.DataParallel) else teacher.model.FU
+
+    def _save_teacher_feat(_module, _inputs, output):
+        teacher_feat_cache['feat'] = output.detach()
+
+    hook_handle = teacher_fu.register_forward_hook(_save_teacher_feat)
+
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', ncols=120)
     total_loss = 0.0
     total_hard = 0.0
@@ -174,9 +183,9 @@ def train_one_epoch(
         with torch.no_grad():
             qt_teacher = _format_teacher_qtable(batch, dct_clean, device)
             teacher_logits = teacher(img_clean, dct_clean, qt_teacher)
-            # 教师中间特征：这里假设使用 decoder 之前的融合特征，需从 seg_dtd.model 中获取
-            # 简单起见，可先使用最终 logits 作为 feature proxy
-            teacher_feat = teacher_logits
+            teacher_feat = teacher_feat_cache['feat']
+            if teacher_feat is None:
+                raise RuntimeError("Failed to capture teacher fusion feature from FU layer.")
 
         optimizer.zero_grad()
         with autocast():
@@ -211,6 +220,8 @@ def train_one_epoch(
             'soft': f'{total_soft / n_batches:.4f}',
             'feat': f'{total_feat / n_batches:.4f}',
         })
+
+    hook_handle.remove()
 
     return (
         total_loss / max(1, n_batches),
