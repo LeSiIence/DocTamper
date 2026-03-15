@@ -50,6 +50,24 @@ def _patch_legacy_gelu(module):
             m.scale_by_keep = True
 
 
+def _format_teacher_qtable(batch, dct_tensor, device):
+    """
+    教师 FPH 需要 qtable 形状为 (B, 1, 8, 8)。
+    """
+    if 'qtb' in batch:
+        qtb = batch['qtb'].to(device)
+    else:
+        qtb = torch.zeros(dct_tensor.size(0), 8, 8, dtype=torch.long, device=device)
+
+    if qtb.dim() == 2:
+        # (B, 64) -> (B, 8, 8)
+        qtb = qtb.view(qtb.size(0), 8, 8)
+    if qtb.dim() == 3:
+        # (B, 8, 8) -> (B, 1, 8, 8)
+        qtb = qtb.unsqueeze(1)
+    return qtb.long()
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='./', help='根目录，包含 LMDB 与 pks 目录')
@@ -154,7 +172,8 @@ def train_one_epoch(
 
         # 教师前向：需要融合中间特征，使用原 DTD 的接口
         with torch.no_grad():
-            teacher_logits = teacher(img_clean, dct_clean, batch.get('qtb', None).to(device) if 'qtb' in batch else dct_clean.new_zeros(dct_clean.size(0), 64, dtype=torch.long))
+            qt_teacher = _format_teacher_qtable(batch, dct_clean, device)
+            teacher_logits = teacher(img_clean, dct_clean, qt_teacher)
             # 教师中间特征：这里假设使用 decoder 之前的融合特征，需从 seg_dtd.model 中获取
             # 简单起见，可先使用最终 logits 作为 feature proxy
             teacher_feat = teacher_logits

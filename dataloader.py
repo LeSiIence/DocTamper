@@ -148,5 +148,6 @@ class DocTamperDataset(Dataset):
                 'img_dist': img_dist,
                 'dct_clean': np.clip(np.abs(dct_clean), 0, 20),
                 'dct_dist': np.clip(np.abs(dct_dist), 0, 20),
+                'qtb': use_qtb,
                 'mask': mask_tensor.long(),
             }
