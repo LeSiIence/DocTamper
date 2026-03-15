@@ -9,6 +9,7 @@ import pickle
 import six
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
+import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torchvision
 
@@ -36,7 +37,32 @@ class DocTamperDataset(Dataset):
         with open('pks/'+roots+'_%d.pk'%minq,'rb') as f: # random compression factors with the same random seed
             self.record = pickle.load(f)
         self.totsr = ToTensorV2()
-        self.toctsr =torchvision.transforms.Compose([torchvision.transforms.ToTensor(),torchvision.transforms.Normalize(mean=(0.485, 0.455, 0.406), std=(0.229, 0.224, 0.225))])
+        # 基础归一化与张量化（与原始逻辑保持一致）
+        self.toctsr = torchvision.transforms.Compose([
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(
+                mean=(0.485, 0.455, 0.406),
+                std=(0.229, 0.224, 0.225)
+            )
+        ])
+
+        # 在线数据增强：干净图与失真图的 Albumentations 管道
+        self.clean_transform = A.Compose([
+            A.Resize(512, 512),
+            A.Normalize(mean=(0.485, 0.455, 0.406),
+                        std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+
+        self.distort_transform = A.Compose([
+            A.Resize(512, 512),
+            A.GaussNoise(p=0.5),
+            A.GaussianBlur(p=0.5),
+            A.ImageCompression(quality_lower=30, quality_upper=70, p=1.0),
+            A.Normalize(mean=(0.485, 0.455, 0.406),
+                        std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
 
     def __len__(self):
         return self.max_nums
@@ -63,24 +89,58 @@ class DocTamperDataset(Dataset):
                 if choicei>0:
                     q1 = int(record[-2])
                     use_qtb1 = self.pks[q1]
-            mask = self.totsr(image=mask.copy())['image']
+
+            # 统一调整 mask 到 512x512，并转为张量
+            mask_resized = cv2.resize(mask, (512, 512), interpolation=cv2.INTER_NEAREST)
+            mask_tensor = self.totsr(image=mask_resized.copy())['image']
+
+            # ---------- 干净图像的 DCT 提取（保持原逻辑） ----------
             with tempfile.NamedTemporaryFile(delete=True) as tmp:
-                im = im.convert("L")
+                im_gray = im.convert("L")
                 if True:
                     if choicei>1:
-                        im.save(tmp,"JPEG",quality=q2)
-                        im = Image.open(tmp)
+                        im_gray.save(tmp, "JPEG", quality=q2)
+                        im_gray = Image.open(tmp)
                     if choicei>0:
-                        im.save(tmp,"JPEG",quality=q1)
-                        im = Image.open(tmp)
-                    im.save(tmp,"JPEG",quality=q)
-                jpg = jpegio.read(tmp.name)
-                dct = jpg.coef_arrays[0].copy()
-                im = im.convert('RGB')
+                        im_gray.save(tmp, "JPEG", quality=q1)
+                        im_gray = Image.open(tmp)
+                    im_gray.save(tmp, "JPEG", quality=q)
+                jpg_clean = jpegio.read(tmp.name)
+                dct_clean = jpg_clean.coef_arrays[0].copy()
+                im_clean_rgb = im_gray.convert('RGB')
+
+            # ---------- 使用 Albumentations 生成干净 / 失真图 ----------
+            im_clean_np = np.array(im_clean_rgb)
+            clean_aug = self.clean_transform(image=im_clean_np)
+            img_clean = clean_aug['image']
+
+            # 以干净图为基准进行失真增强
+            dist_aug = self.distort_transform(image=im_clean_np)
+            img_dist = dist_aug['image']
+            im_dist_np = dist_aug['image'].permute(1, 2, 0).cpu().numpy()
+            im_dist_np = (im_dist_np * np.array([0.229, 0.224, 0.225])[None, None, :] +
+                          np.array([0.485, 0.455, 0.406])[None, None, :])
+            im_dist_np = np.clip(im_dist_np * 255.0, 0, 255).astype(np.uint8)
+            im_dist_rgb = Image.fromarray(im_dist_np)
+
+            # ---------- 失真图像的 DCT 提取（沿用相同 JPEG+DCT 逻辑） ----------
+            with tempfile.NamedTemporaryFile(delete=True) as tmp2:
+                im_dist_gray = im_dist_rgb.convert("L")
+                if True:
+                    if choicei>1:
+                        im_dist_gray.save(tmp2, "JPEG", quality=q2)
+                        im_dist_gray = Image.open(tmp2)
+                    if choicei>0:
+                        im_dist_gray.save(tmp2, "JPEG", quality=q1)
+                        im_dist_gray = Image.open(tmp2)
+                    im_dist_gray.save(tmp2, "JPEG", quality=q)
+                jpg_dist = jpegio.read(tmp2.name)
+                dct_dist = jpg_dist.coef_arrays[0].copy()
+
             return {
-                'image': self.toctsr(im),
-                'label': mask.long(),
-                'dct': np.clip(np.abs(dct),0,20),
-                'qtb':use_qtb,
-                'q':q
+                'img_clean': img_clean,
+                'img_dist': img_dist,
+                'dct_clean': np.clip(np.abs(dct_clean), 0, 20),
+                'dct_dist': np.clip(np.abs(dct_dist), 0, 20),
+                'mask': mask_tensor.long(),
             }
