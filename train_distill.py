@@ -38,6 +38,15 @@ def _load_teacher_state_dict(teacher, ckpt_path):
     teacher.load_state_dict(best_state, strict=True)
 
 
+def _patch_legacy_gelu(module):
+    """
+    兼容旧权重/旧序列化对象中 GELU 缺失 approximate 属性的问题。
+    """
+    for m in module.modules():
+        if isinstance(m, torch.nn.GELU) and not hasattr(m, "approximate"):
+            m.approximate = "none"
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='./', help='根目录，包含 LMDB 与 pks 目录')
@@ -62,6 +71,7 @@ def build_models(args):
 
     # 教师模型：加载权重并冻结
     teacher = seg_dtd('', 2).to(device)
+    _patch_legacy_gelu(teacher)
     _load_teacher_state_dict(teacher, args.teacher_pth)
     teacher.eval()
     for p in teacher.parameters():
@@ -69,6 +79,7 @@ def build_models(args):
 
     # 学生模型
     student = LightDTD(fph_out_channels=128, pretrained_vph=False, classes=2).to(device)
+    _patch_legacy_gelu(student)
     student.train()
 
     if torch.cuda.device_count() > 1 and device.type == 'cuda':
