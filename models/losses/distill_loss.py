@@ -37,6 +37,11 @@ class FeatureAlignmentLoss(nn.Module):
         self.criterion = nn.MSELoss(reduction=reduction)
 
     def forward(self, student_feat: torch.Tensor, teacher_feat: torch.Tensor) -> torch.Tensor:
+        # 通道应由 Adaptation Layer 对齐；空间尺寸允许不一致，这里自动对齐到学生尺度
+        if teacher_feat.shape[-2:] != student_feat.shape[-2:]:
+            teacher_feat = F.interpolate(
+                teacher_feat, size=student_feat.shape[-2:], mode="bilinear", align_corners=False
+            )
         return self.criterion(student_feat, teacher_feat)
 
 
