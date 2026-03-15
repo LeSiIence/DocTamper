@@ -34,8 +34,10 @@ except ImportError:
     from models.fph import FPH
 import albumentations as A
 try:
+    import swins as swins_module
     from swins import *
 except ImportError:
+    import models.swins as swins_module
     from models.swins import *
 from albumentations.pytorch import ToTensorV2
 import torchvision
@@ -55,6 +57,16 @@ sys.modules.setdefault("dtd", sys.modules[__name__])
 try:
     import timm.layers.drop as _timm_layers_drop
     sys.modules.setdefault("timm.models.layers.drop", _timm_layers_drop)
+except Exception:
+    pass
+# 兼容历史权重将 swins 类序列化到 __main__ 命名空间
+try:
+    import __main__ as _main_mod
+    for _name in dir(swins_module):
+        if _name.startswith("_"):
+            continue
+        if not hasattr(_main_mod, _name):
+            setattr(_main_mod, _name, getattr(swins_module, _name))
 except Exception:
     pass
 
