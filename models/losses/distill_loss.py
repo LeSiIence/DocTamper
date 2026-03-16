@@ -11,7 +11,7 @@ class SoftLabelLoss(nn.Module):
     使用 KL 散度在温度 T 下对学生 / 教师的类别分布进行对齐。
     """
 
-    def __init__(self, temperature: float = 2.0, reduction: str = "batchmean"):
+    def __init__(self, temperature: float = 2.0, reduction: str = "mean"):
         super().__init__()
         self.temperature = temperature
         # KLDivLoss 期望输入为 log-prob，target 为 prob
