@@ -1,4 +1,5 @@
 import os
+import time
 import cv2
 import lmdb
 import torch
@@ -37,7 +38,7 @@ args = parser.parse_args()
 
 
 class TamperDataset(Dataset):
-    def __init__(self, roots, mode, minq=95, qtb=90, max_readers=64):
+    def __init__(self, roots, mode, minq=95, qtb=90, max_readers=64, dataset_name=None):
         self.envs = lmdb.open(roots, max_readers=max_readers, readonly=True, lock=False, readahead=False, meminit=False)
         with self.envs.begin(write=False) as txn:
             self.nSamples = int(txn.get('num-samples'.encode('utf-8')))
@@ -49,7 +50,9 @@ class TamperDataset(Dataset):
         self.pks = {}
         for k, v in pks.items():
             self.pks[k] = torch.LongTensor(v)
-        with open('pks/' + roots + '_%d.pk' % minq, 'rb') as f:
+        name_for_pks = dataset_name if dataset_name is not None else os.path.basename(os.path.normpath(roots))
+        pks_path = os.path.join('pks', '%s_%d.pk' % (name_for_pks, minq))
+        with open(pks_path, 'rb') as f:
             self.record = pickle.load(f)
         self.hflip = torchvision.transforms.RandomHorizontalFlip(p=1.0)
         self.vflip = torchvision.transforms.RandomVerticalFlip(p=1.0)
@@ -106,7 +109,8 @@ class TamperDataset(Dataset):
             }
 
 
-test_data = TamperDataset(args.data_root + args.lmdb_name, False, minq=args.minq)
+lmdb_path = os.path.join(args.data_root, args.lmdb_name)
+test_data = TamperDataset(lmdb_path, False, minq=args.minq, dataset_name=args.lmdb_name)
 
 
 class IOUMetric:
