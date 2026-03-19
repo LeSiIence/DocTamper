@@ -96,7 +96,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--alpha', type=float, default=1.0)
     parser.add_argument('--beta', type=float, default=1.0)
-    parser.add_argument('--gamma', type=float, default=0.01)
+    parser.add_argument('--gamma', type=float, default=0.1)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--save_dir', type=str, default='pths')
     parser.add_argument('--save_dir_drive', type=str, default='',
@@ -173,6 +173,7 @@ def train_one_epoch(
     optimizer,
     scaler,
     device,
+    scheduler=None,
 ):
     teacher.eval()
     student.train()
@@ -245,6 +246,8 @@ def train_one_epoch(
         })
 
     hook_handle.remove()
+    if scheduler is not None:
+        scheduler.step()
 
     return (
         total_loss / max(1, n_batches),
@@ -274,6 +277,7 @@ def main():
     teacher, student, device = build_models(args)
     criterion = build_criterion(args).to(device)
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, student.parameters()), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     scaler = GradScaler()
     start_epoch = 1
 
@@ -285,6 +289,8 @@ def main():
         _load_student_state_dict(student, student_state)
         if 'optimizer' in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt['optimizer'])
+        if 'scheduler' in resume_ckpt:
+            scheduler.load_state_dict(resume_ckpt['scheduler'])
         if 'scaler' in resume_ckpt:
             scaler.load_state_dict(resume_ckpt['scaler'])
         start_epoch = int(resume_ckpt.get('epoch', 0)) + 1
@@ -300,9 +306,11 @@ def main():
             optimizer,
             scaler,
             device,
+            scheduler=scheduler,
         )
 
-        print(f'Epoch {epoch}: loss={loss:.4f}, hard={hard:.4f}, soft={soft:.4f}, feat={feat:.4f}')
+        cur_lr = optimizer.param_groups[0]['lr']
+        print(f'Epoch {epoch}: loss={loss:.4f}, hard={hard:.4f}, soft={soft:.4f}, feat={feat:.4f}, lr={cur_lr:.6f}')
 
         if epoch % args.save_interval == 0:
             ckpt_name = f'light_dtd_distill_epoch{epoch}.pth'
@@ -311,6 +319,7 @@ def main():
                 'epoch': epoch,
                 'student_state': student.module.state_dict() if isinstance(student, nn.DataParallel) else student.state_dict(),
                 'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
             }
             torch.save(state, save_path)

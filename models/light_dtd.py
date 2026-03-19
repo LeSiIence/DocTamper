@@ -153,10 +153,17 @@ class FPH_Light(nn.Module):
 class AdaptationLayer(nn.Module):
     def __init__(self, in_channels: int, out_channels: int = TEACHER_FUSION_CHANNELS):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, 1)
+        mid_ch = (in_channels + out_channels) // 2
+        self.adapt = nn.Sequential(
+            nn.Conv2d(in_channels, mid_ch, 1, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_ch, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
+        return self.adapt(x)
 
 
 # ---------- Decoder_Light: 轻量 FPN / 简化 U-Net，输出单通道 ----------
