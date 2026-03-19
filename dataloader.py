@@ -53,9 +53,16 @@ class DocTamperDataset(Dataset):
             )
         ])
 
-        # 在线数据增强：当前蒸馏阶段统一使用干净输入（关闭噪声/模糊/强JPEG增强）
-        self.clean_transform = A.Compose([
+        # 几何增强：对 RGB + mask 同步做翻转/旋转（在 DCT 提取之前，作用于 PIL 图）
+        self.spatial_transform = A.Compose([
             A.Resize(512, 512),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.3),
+            A.RandomRotate90(p=0.3),
+        ])
+
+        # 归一化 + 张量化（作用于增强后的 numpy RGB，DCT 提取之后）
+        self.norm_transform = A.Compose([
             A.Normalize(mean=(0.485, 0.455, 0.406),
                         std=(0.229, 0.224, 0.225)),
             ToTensorV2()
@@ -95,9 +102,14 @@ class DocTamperDataset(Dataset):
                         q_seq.append(q1)
                     q_seq.append(q)
 
-                    # 统一调整 mask 到 512x512，并转为张量
+                    # 几何增强：对 RGB + mask 同步做空间变换（在 DCT 提取之前）
+                    im_np = np.array(im.resize((512, 512), Image.BILINEAR))
                     mask_resized = cv2.resize(mask, (512, 512), interpolation=cv2.INTER_NEAREST)
-                    mask_tensor = self.totsr(image=mask_resized.copy())['image']
+                    aug = self.spatial_transform(image=im_np, mask=mask_resized)
+                    im_aug_np = aug['image']         # (512,512,3) uint8
+                    mask_aug = aug['mask']            # (512,512) uint8
+                    mask_tensor = self.totsr(image=mask_aug.copy())['image']
+                    im_aug_pil = Image.fromarray(im_aug_np)
 
                     def _extract_dct_with_quality_chain(pil_rgb):
                         with tempfile.NamedTemporaryFile(delete=True, suffix='.jpg') as tmp:
@@ -113,18 +125,14 @@ class DocTamperDataset(Dataset):
                                     f'jpegio read failed at index={cur_index}, fallback zero DCT: {exc}',
                                     RuntimeWarning
                                 )
-                                # fallback 维持可训练，避免 worker 崩溃
                                 dct = np.zeros((512, 512), dtype=np.float32)
                             return dct, pil_gray.convert('RGB')
 
-                    # ---------- 干净图像 ----------
-                    dct_clean, im_clean_rgb = _extract_dct_with_quality_chain(im)
+                    dct_clean, im_clean_rgb = _extract_dct_with_quality_chain(im_aug_pil)
 
-                    # ---------- 使用 Albumentations 生成干净图 ----------
                     im_clean_np = np.array(im_clean_rgb)
-                    clean_aug = self.clean_transform(image=im_clean_np)
-                    img_clean = clean_aug['image']
-                    # 学生输入与教师输入保持一致：同一份干净图像与干净 DCT
+                    normed = self.norm_transform(image=im_clean_np)
+                    img_clean = normed['image']
                     img_dist = img_clean.clone()
                     dct_dist = dct_clean.copy()
 

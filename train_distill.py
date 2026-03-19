@@ -11,7 +11,7 @@ from tqdm import tqdm
 from dataloader import DocTamperDataset
 from models.dtd import seg_dtd
 from models.light_dtd import LightDTD
-from models.losses import SoftBCEWithLogitsLoss, LovaszLoss
+from models.losses import SoftBCEWithLogitsLoss, LovaszLoss, DiceLoss
 from models.losses.distill_loss import DistillationLoss
 
 
@@ -130,15 +130,16 @@ def build_models(args):
 
 
 def build_criterion(args):
-    # BCE + Lovasz 作为 hard loss
     bce = SoftBCEWithLogitsLoss()
     lovasz = LovaszLoss(mode='multiclass')
+    dice = DiceLoss(mode='multiclass', from_logits=True, smooth=1.0)
 
     class HardLoss(nn.Module):
         def __init__(self):
             super().__init__()
             self.bce = bce
             self.lovasz = lovasz
+            self.dice = dice
 
         def forward(self, logits, target):
             # logits: (N, 2, H, W), target: (N, 1, H, W) 或 (N, H, W)
@@ -146,10 +147,11 @@ def build_criterion(args):
                 target_ = target.unsqueeze(1).float()
             else:
                 target_ = target.float()
+            target_long = target.squeeze(1).long()
             loss_bce = self.bce(logits[:, 1:2, ...], target_)
-            # Lovasz 接收 logits 与 [B,H,W] 的标签（前景类索引 1）
-            loss_lovasz = self.lovasz(logits, target.squeeze(1).long())
-            return loss_bce + loss_lovasz
+            loss_lovasz = self.lovasz(logits, target_long)
+            loss_dice = self.dice(logits, target_long)
+            return 0.5 * loss_bce + loss_lovasz + loss_dice
 
     hard_loss = HardLoss()
     distill = DistillationLoss(

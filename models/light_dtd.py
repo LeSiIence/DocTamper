@@ -29,6 +29,24 @@ class DepthwiseSeparableConv2d(nn.Module):
         return F.relu(self.bn_pw(self.pw(x)))
 
 
+class LightSCSE(nn.Module):
+    """轻量 SCSE 注意力：通道 SE + 空间 SE，与教师 DTD 的 SCSEModule 对应。"""
+
+    def __init__(self, in_channels: int, reduction: int = 8):
+        super().__init__()
+        self.cSE = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, in_channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction, in_channels, 1),
+            nn.Sigmoid(),
+        )
+        self.sSE = nn.Sequential(nn.Conv2d(in_channels, 1, 1), nn.Sigmoid())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.cSE(x) + x * self.sSE(x)
+
+
 class AddCoords(nn.Module):
     """与 fph.py 一致的坐标嵌入"""
     def __init__(self, with_r: bool = True):
@@ -213,6 +231,7 @@ class LightDTD(nn.Module):
         visual_ch = self.vph.out_channels[-1]
         fused_ch = visual_ch + self.fph.out_channels
         self.fuse_conv = nn.Sequential(
+            LightSCSE(fused_ch, reduction=8),
             nn.Conv2d(fused_ch, fused_ch, 3, padding=1),
             nn.BatchNorm2d(fused_ch),
             nn.ReLU(inplace=True),
