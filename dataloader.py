@@ -53,19 +53,9 @@ class DocTamperDataset(Dataset):
             )
         ])
 
-        # 在线数据增强：干净图与失真图的 Albumentations 管道
+        # 在线数据增强：当前蒸馏阶段统一使用干净输入（关闭噪声/模糊/强JPEG增强）
         self.clean_transform = A.Compose([
             A.Resize(512, 512),
-            A.Normalize(mean=(0.485, 0.455, 0.406),
-                        std=(0.229, 0.224, 0.225)),
-            ToTensorV2()
-        ])
-
-        self.distort_transform = A.Compose([
-            A.Resize(512, 512),
-            A.GaussNoise(p=0.5),
-            A.GaussianBlur(p=0.5),
-            A.ImageCompression(quality_lower=30, quality_upper=70, p=1.0),
             A.Normalize(mean=(0.485, 0.455, 0.406),
                         std=(0.229, 0.224, 0.225)),
             ToTensorV2()
@@ -130,21 +120,13 @@ class DocTamperDataset(Dataset):
                     # ---------- 干净图像 ----------
                     dct_clean, im_clean_rgb = _extract_dct_with_quality_chain(im)
 
-                    # ---------- 使用 Albumentations 生成干净 / 失真图 ----------
+                    # ---------- 使用 Albumentations 生成干净图 ----------
                     im_clean_np = np.array(im_clean_rgb)
                     clean_aug = self.clean_transform(image=im_clean_np)
                     img_clean = clean_aug['image']
-
-                    dist_aug = self.distort_transform(image=im_clean_np)
-                    img_dist = dist_aug['image']
-                    im_dist_np = dist_aug['image'].permute(1, 2, 0).cpu().numpy()
-                    im_dist_np = (im_dist_np * np.array([0.229, 0.224, 0.225])[None, None, :] +
-                                  np.array([0.485, 0.455, 0.406])[None, None, :])
-                    im_dist_np = np.clip(im_dist_np * 255.0, 0, 255).astype(np.uint8)
-                    im_dist_rgb = Image.fromarray(im_dist_np)
-
-                    # ---------- 失真图像 ----------
-                    dct_dist, _ = _extract_dct_with_quality_chain(im_dist_rgb)
+                    # 学生输入与教师输入保持一致：同一份干净图像与干净 DCT
+                    img_dist = img_clean.clone()
+                    dct_dist = dct_clean.copy()
 
                     return {
                         'img_clean': img_clean,

@@ -96,7 +96,7 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--alpha', type=float, default=1.0)
     parser.add_argument('--beta', type=float, default=1.0)
-    parser.add_argument('--gamma', type=float, default=1.0)
+    parser.add_argument('--gamma', type=float, default=0.01)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--save_dir', type=str, default='pths')
     parser.add_argument('--save_dir_drive', type=str, default='',
@@ -192,10 +192,10 @@ def train_one_epoch(
     n_batches = 0
 
     for batch in pbar:
-        img_clean = batch['img_clean'].to(device)      # 给教师
-        img_dist = batch['img_dist'].to(device)        # 给学生
-        dct_clean = batch['dct_clean'].to(device)      # 教师 DCT
-        dct_dist = batch['dct_dist'].to(device)        # 学生 DCT
+        img_clean = batch['img_clean'].to(device)      # 教师/学生统一输入
+        dct_clean = batch['dct_clean'].to(device)      # 教师/学生统一 DCT
+        img_dist = img_clean
+        dct_dist = dct_clean
         mask = batch['mask'].to(device)                # 真实标签 (N,1,512,512)
 
         # 教师前向：需要融合中间特征，使用原 DTD 的接口
@@ -208,9 +208,11 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         with autocast():
-            # 学生前向
-            # qtable 这里没有 LMDB 中的显式 qtb，可用全零或根据需要扩展 dataloader
-            qt_student = dct_dist.new_zeros(dct_dist.size(0), 64, dtype=torch.long)
+            # 学生前向：与教师一致，使用同一份 qtable（若缺失则退化为全零）
+            if 'qtb' in batch:
+                qt_student = batch['qtb'].to(device).view(dct_dist.size(0), -1).long()
+            else:
+                qt_student = dct_dist.new_zeros(dct_dist.size(0), 64, dtype=torch.long)
             student_logits = student(img_dist, dct_dist, qt_student)
             # 学生中间特征：使用 get_adapted_fusion
             student_feat = student.module.get_adapted_fusion(img_dist, dct_dist, qt_student) if isinstance(student, nn.DataParallel) else student.get_adapted_fusion(img_dist, dct_dist, qt_student)
