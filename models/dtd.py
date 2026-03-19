@@ -1,4 +1,5 @@
 import os
+import sys
 import cv2
 import lmdb
 import torch
@@ -23,18 +24,77 @@ from torch.cuda.amp import autocast
 import segmentation_models_pytorch as smp
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler#need pytorch>1.6
-from losses import DiceLoss,FocalLoss,SoftCrossEntropyLoss,LovaszLoss
-from fph import FPH
+try:
+    from losses import DiceLoss, FocalLoss, SoftCrossEntropyLoss, LovaszLoss
+except ImportError:
+    from models.losses import DiceLoss, FocalLoss, SoftCrossEntropyLoss, LovaszLoss
+try:
+    from fph import FPH
+except ImportError:
+    from models.fph import FPH
 import albumentations as A
-from swins import *
+try:
+    from swins import *
+except ImportError:
+    from models.swins import *
 from albumentations.pytorch import ToTensorV2
 import torchvision
 import torch.nn.functional as F
-from timm.models.layers import trunc_normal_, DropPath
+try:
+    from timm.layers import trunc_normal_, DropPath
+except ImportError:
+    from timm.models.layers import trunc_normal_, DropPath
 from functools import partial
 from segmentation_models_pytorch.base import modules as md
 from typing import Optional, Union, List
 from segmentation_models_pytorch.base import SegmentationModel
+
+# 兼容历史权重中通过顶层模块名 `dtd` 序列化的对象
+sys.modules.setdefault("dtd", sys.modules[__name__])
+
+
+def _resolve_pretrained_path(filename):
+    """
+    Resolve pretrained weight path robustly across different cwd/layouts.
+    """
+    model_dir = os.path.dirname(os.path.abspath(__file__))
+    cwd = os.getcwd()
+
+    # Walk up from current file directory (handles nested DocTamper/models paths)
+    search_roots = []
+    cur = model_dir
+    while True:
+        search_roots.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    # Common Colab root used by this project
+    search_roots.extend([
+        cwd,
+        '/content/DocTamper',
+        '/content/DocTamper/models',
+    ])
+
+    checked = []
+    for root in search_roots:
+        candidates = [
+            os.path.join(root, filename),
+            os.path.join(root, 'models', filename),
+            os.path.join(root, 'pths', filename),
+            os.path.join(root, 'pths', 'checkpoints', filename),
+        ]
+        for path in candidates:
+            if path in checked:
+                continue
+            checked.append(path)
+            if os.path.exists(path):
+                return path
+
+    raise FileNotFoundError(
+        f"Cannot find pretrained weight '{filename}'. Checked paths: {checked}"
+    )
 
 class LayerNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
@@ -291,8 +351,10 @@ class MID(nn.Module):
 class DTD(SegmentationModel):
     def __init__(self, encoder_name = "resnet18", decoder_channels = (384, 192, 96, 64), classes = 1):
         super().__init__()
-        self.vph = torch.load('vph_imagenet.pt', weights_only=False)
-        self.swin = torch.load('swin_imagenet.pt', weights_only=False)
+        vph_path = _resolve_pretrained_path('vph_imagenet.pt')
+        swin_path = _resolve_pretrained_path('swin_imagenet.pt')
+        self.vph = torch.load(vph_path, weights_only=False)
+        self.swin = torch.load(swin_path, weights_only=False)
         self.fph = FPH()
         self.decoder = MID(encoder_channels=(96, 192, 384, 768), decoder_channels=decoder_channels)
         self.segmentation_head = SegmentationHead(in_channels=decoder_channels[-1], out_channels=classes, upsampling=2.0)

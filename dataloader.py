@@ -26,15 +26,21 @@ class DocTamperDataset(Dataset):
         with self.envs.begin(write=False) as txn:
             self.nSamples = int(txn.get('num-samples'.encode('utf-8')))
         if max_nums is None:
-            self.max_nums=self.nSamples
-        self.max_nums=min(max_nums,self.nSamples)
+            self.max_nums = self.nSamples
+        else:
+            self.max_nums = min(max_nums, self.nSamples)
         self.minq = minq # Q
-        with open('qt_table.pk','rb') as fpk:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        lmdb_name = os.path.basename(os.path.normpath(roots))
+        qt_table_path = os.path.join(base_dir, 'qt_table.pk')
+        pks_record_path = os.path.join(base_dir, 'pks', f'{lmdb_name}_{minq}.pk')
+
+        with open(qt_table_path, 'rb') as fpk:
             pks = pickle.load(fpk)
         self.pks = {}
         for k,v in pks.items():
             self.pks[k] = torch.LongTensor(v)
-        with open('pks/'+roots+'_%d.pk'%minq,'rb') as f: # random compression factors with the same random seed
+        with open(pks_record_path, 'rb') as f: # random compression factors with the same random seed
             self.record = pickle.load(f)
         self.totsr = ToTensorV2()
         # 基础归一化与张量化（与原始逻辑保持一致）
