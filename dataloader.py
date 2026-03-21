@@ -23,9 +23,13 @@ class DocTamperDataset(Dataset):
     max_readers : max_readers of the LMDB loader
     '''
     def __init__(self, roots, minq=75, max_nums = None, max_readers=64):
-        self.envs = lmdb.open(roots,max_readers=max_readers,readonly=True,lock=False,readahead=False,meminit=False)
-        with self.envs.begin(write=False) as txn:
+        self._lmdb_path = roots
+        self._max_readers = max_readers
+        self._env = None
+        env = lmdb.open(roots, max_readers=max_readers, readonly=True, lock=False, readahead=False, meminit=False)
+        with env.begin(write=False) as txn:
             self.nSamples = int(txn.get('num-samples'.encode('utf-8')))
+        env.close()
         if max_nums is None:
             self.max_nums = self.nSamples
         else:
@@ -68,15 +72,22 @@ class DocTamperDataset(Dataset):
             ToTensorV2()
         ])
 
+    def _get_env(self):
+        if self._env is None:
+            self._env = lmdb.open(
+                self._lmdb_path, max_readers=self._max_readers,
+                readonly=True, lock=False, readahead=False, meminit=False,
+            )
+        return self._env
+
     def __len__(self):
         return self.max_nums
 
     def __getitem__(self, index):
-        # 针对偶发坏样本（JPEG 结构异常等）做容错重试，避免 DataLoader worker 直接崩溃
         for retry in range(3):
             cur_index = (index + retry) % self.max_nums
             try:
-                with self.envs.begin(write=False) as txn:
+                with self._get_env().begin(write=False) as txn:
                     img_key = 'image-%09d' % cur_index
                     imgbuf = txn.get(img_key.encode('utf-8'))
                     lbl_key = 'label-%09d' % cur_index
@@ -132,7 +143,7 @@ class DocTamperDataset(Dataset):
 
                     im_clean_np = np.array(im_clean_rgb)
                     normed = self.norm_transform(image=im_clean_np)
-xian'c 
+
                     return {
                         'image': normed['image'],
                         'dct': np.clip(np.abs(dct_clean), 0, 20),
