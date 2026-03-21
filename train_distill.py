@@ -91,7 +91,7 @@ def parse_args():
     parser.add_argument('--minq', type=int, default=75)
     parser.add_argument('--teacher_pth', type=str, default='pths/dtd_doctamper.pth')
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--batch_size', type=int, default=96)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--alpha', type=float, default=1.0)
@@ -177,14 +177,20 @@ def train_one_epoch(
     teacher.eval()
     student.train()
 
-    # 抓取教师融合层特征（与学生 adapt 后特征对齐）
     teacher_feat_cache = {'feat': None}
+    student_feat_cache = {'feat': None}
+
     teacher_fu = teacher.module.model.FU if isinstance(teacher, nn.DataParallel) else teacher.model.FU
+    student_adapt = student.module.adapt_layer if isinstance(student, nn.DataParallel) else student.adapt_layer
 
     def _save_teacher_feat(_module, _inputs, output):
         teacher_feat_cache['feat'] = output.detach()
 
-    hook_handle = teacher_fu.register_forward_hook(_save_teacher_feat)
+    def _save_student_feat(_module, _inputs, output):
+        student_feat_cache['feat'] = output
+
+    hook_teacher = teacher_fu.register_forward_hook(_save_teacher_feat)
+    hook_student = student_adapt.register_forward_hook(_save_student_feat)
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch}', ncols=120)
     total_loss = 0.0
@@ -194,30 +200,25 @@ def train_one_epoch(
     n_batches = 0
 
     for batch in pbar:
-        img_clean = batch['img_clean'].to(device)      # 教师/学生统一输入
-        dct_clean = batch['dct_clean'].to(device)      # 教师/学生统一 DCT
-        img_dist = img_clean
-        dct_dist = dct_clean
-        mask = batch['mask'].to(device)                # 真实标签 (N,1,512,512)
+        img = batch['image'].to(device, non_blocking=True)
+        dct = batch['dct'].to(device, non_blocking=True)
+        mask = batch['mask'].to(device, non_blocking=True)
 
-        # 教师前向：需要融合中间特征，使用原 DTD 的接口
         with torch.no_grad():
-            qt_teacher = _format_teacher_qtable(batch, dct_clean, device)
-            teacher_logits = teacher(img_clean, dct_clean, qt_teacher)
+            qt_teacher = _format_teacher_qtable(batch, dct, device)
+            teacher_logits = teacher(img, dct, qt_teacher)
             teacher_feat = teacher_feat_cache['feat']
             if teacher_feat is None:
                 raise RuntimeError("Failed to capture teacher fusion feature from FU layer.")
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         with autocast():
-            # 学生前向：与教师一致，使用同一份 qtable（若缺失则退化为全零）
             if 'qtb' in batch:
-                qt_student = batch['qtb'].to(device).view(dct_dist.size(0), -1).long()
+                qt_student = batch['qtb'].to(device, non_blocking=True).view(dct.size(0), -1).long()
             else:
-                qt_student = dct_dist.new_zeros(dct_dist.size(0), 64, dtype=torch.long)
-            student_logits = student(img_dist, dct_dist, qt_student)
-            # 学生中间特征：使用 get_adapted_fusion
-            student_feat = student.module.get_adapted_fusion(img_dist, dct_dist, qt_student) if isinstance(student, nn.DataParallel) else student.get_adapted_fusion(img_dist, dct_dist, qt_student)
+                qt_student = dct.new_zeros(dct.size(0), 64, dtype=torch.long)
+            student_logits = student(img, dct, qt_student)
+            student_feat = student_feat_cache['feat']
 
             loss, loss_hard, loss_soft, loss_feat = criterion(
                 student_logits,
@@ -244,7 +245,8 @@ def train_one_epoch(
             'feat': f'{total_feat / n_batches:.4f}',
         })
 
-    hook_handle.remove()
+    hook_teacher.remove()
+    hook_student.remove()
 
     return (
         total_loss / max(1, n_batches),
@@ -260,15 +262,21 @@ def main():
     if args.save_dir_drive:
         os.makedirs(args.save_dir_drive, exist_ok=True)
 
-    # 数据集和 DataLoader
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     lmdb_path = os.path.join(args.data_root, args.lmdb_name)
     train_dataset = DocTamperDataset(lmdb_path, minq=args.minq)
+    use_persistent = args.num_workers > 0
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=4 if use_persistent else None,
     )
 
     teacher, student, device = build_models(args)

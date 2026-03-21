@@ -132,15 +132,10 @@ class DocTamperDataset(Dataset):
 
                     im_clean_np = np.array(im_clean_rgb)
                     normed = self.norm_transform(image=im_clean_np)
-                    img_clean = normed['image']
-                    img_dist = img_clean.clone()
-                    dct_dist = dct_clean.copy()
-
+xian'c 
                     return {
-                        'img_clean': img_clean,
-                        'img_dist': img_dist,
-                        'dct_clean': np.clip(np.abs(dct_clean), 0, 20),
-                        'dct_dist': np.clip(np.abs(dct_dist), 0, 20),
+                        'image': normed['image'],
+                        'dct': np.clip(np.abs(dct_clean), 0, 20),
                         'qtb': use_qtb,
                         'mask': mask_tensor.long(),
                     }
