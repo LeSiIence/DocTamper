@@ -87,7 +87,7 @@ def _format_teacher_qtable(batch, dct_tensor, device):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='./', help='根目录，包含 LMDB 与 pks 目录')
-    parser.add_argument('--lmdb_name', type=str, default='DocTamperV1-FCD', help='LMDB 文件名')
+    parser.add_argument('--lmdb_name', type=str, default='DocTamperV1-TrainingSet', help='LMDB 文件名')
     parser.add_argument('--minq', type=int, default=75)
     parser.add_argument('--teacher_pth', type=str, default='pths/dtd_doctamper.pth')
     parser.add_argument('--epochs', type=int, default=50)
