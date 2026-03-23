@@ -28,4 +28,5 @@ logs/
 # Project data / caches
 stg/
 *.lmdb
+doctamper-serving/
 
