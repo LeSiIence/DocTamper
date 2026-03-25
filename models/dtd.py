@@ -71,6 +71,13 @@ except Exception:
     pass
 
 
+def _fix_timm_drop_path_compat(root: nn.Module) -> None:
+    """torch.load 的 VPH/Swin 若由旧版 timm 保存，DropPath 无 scale_by_keep；新版 timm forward 会访问该属性。"""
+    for m in root.modules():
+        if isinstance(m, DropPath) and not hasattr(m, "scale_by_keep"):
+            m.scale_by_keep = True
+
+
 def _resolve_pretrained_path(filename):
     """
     Resolve pretrained weight path robustly across different cwd/layouts.
@@ -386,7 +393,9 @@ class DTD(SegmentationModel):
         vph_path = _resolve_pretrained_path('vph_imagenet.pt')
         swin_path = _resolve_pretrained_path('swin_imagenet.pt')
         self.vph = torch.load(vph_path, weights_only=False)
+        _fix_timm_drop_path_compat(self.vph)
         self.swin = torch.load(swin_path, weights_only=False)
+        _fix_timm_drop_path_compat(self.swin)
         self.fph = FPH()
         self.decoder = MID(encoder_channels=(96, 192, 384, 768), decoder_channels=decoder_channels)
         self.segmentation_head = SegmentationHead(in_channels=decoder_channels[-1], out_channels=classes, upsampling=2.0)
