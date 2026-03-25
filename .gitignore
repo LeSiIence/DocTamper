@@ -30,3 +30,31 @@ stg/
 *.lmdb
 doctamper-serving/
 
+# --- Binary / LMDB / large datasets (do not commit) ---
+*.mdb
+lock.mdb
+
+# Default DocTamper LMDB roots (download or build locally)
+DocTamperV1-FCD/
+DocTamperV1-TrainingSet/
+
+# Pickled qt table & pks from generate_pks.py / training prep
+*.pk
+
+# Local jpegio clone + build tree (pip/setup installs into env)
+models/jpegio/
+_jpegio_build/
+
+# Windows NTFS alternate data stream marker (often copied from Windows)
+*Zone.Identifier
+
+# Jupyter/editor scratch filenames
+Untitled
+Untitled.ipynb
+
+# Compiled extensions / native wheels unpacked locally
+*.so
+*.pyd
+*.dll
+*.dylib
+
