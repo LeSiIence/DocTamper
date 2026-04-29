@@ -1,9 +1,9 @@
 """
 LightDTD: 轻量化学生网络，用于篡改检测与知识蒸馏。
 - VPH_Light: MobileNetV3-Small 前三个 Stage 作为视觉多尺度特征
-- FPH_Light: DCT + 量化表嵌入，深度可分离卷积，输出 64/128 通道
+- FPH_Light: DCT + 量化表嵌入，深度可分离卷积，输出 64 通道
 - Adaptation Layer: 融合特征通道对齐到教师融合层 192 通道
-- Decoder_Light: 轻量 FPN 式解码，输出单通道 Mask
+- Decoder_Light: 增强型 FPN 解码，DSConv + LightSCSE 注意力
 """
 import torch
 import torch.nn as nn
@@ -11,34 +11,32 @@ import torch.nn.functional as F
 import torchvision.models as tv_models
 from typing import List, Tuple
 
-# 教师 DTD 融合层输出通道（dtd.py 中 FU: 448 -> 192）
 TEACHER_FUSION_CHANNELS = 192
 
 
 class DepthwiseSeparableConv2d(nn.Module):
-    """深度可分离卷积：DW + PW"""
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, stride: int = 1):
         super().__init__()
-        self.dw = nn.Conv2d(in_ch, in_ch, kernel_size, stride=stride, padding=kernel_size // 2, groups=in_ch)
+        self.dw = nn.Conv2d(in_ch, in_ch, kernel_size, stride=stride,
+                            padding=kernel_size // 2, groups=in_ch, bias=False)
         self.bn_dw = nn.BatchNorm2d(in_ch)
-        self.pw = nn.Conv2d(in_ch, out_ch, 1)
+        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
         self.bn_pw = nn.BatchNorm2d(out_ch)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.bn_dw(self.dw(x)))
-        return F.relu(self.bn_pw(self.pw(x)))
+        x = F.relu(self.bn_dw(self.dw(x)), inplace=True)
+        return F.relu(self.bn_pw(self.pw(x)), inplace=True)
 
 
 class LightSCSE(nn.Module):
-    """轻量 SCSE 注意力：通道 SE + 空间 SE，与教师 DTD 的 SCSEModule 对应。"""
-
     def __init__(self, in_channels: int, reduction: int = 8):
         super().__init__()
+        mid = max(in_channels // reduction, 1)
         self.cSE = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, in_channels // reduction, 1),
+            nn.Conv2d(in_channels, mid, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // reduction, in_channels, 1),
+            nn.Conv2d(mid, in_channels, 1),
             nn.Sigmoid(),
         )
         self.sSE = nn.Sequential(nn.Conv2d(in_channels, 1, 1), nn.Sigmoid())
@@ -48,7 +46,6 @@ class LightSCSE(nn.Module):
 
 
 class AddCoords(nn.Module):
-    """与 fph.py 一致的坐标嵌入"""
     def __init__(self, with_r: bool = True):
         super().__init__()
         self.with_r = with_r
@@ -69,19 +66,16 @@ class AddCoords(nn.Module):
         return ret
 
 
-# ---------- VPH_Light: MobileNetV3-Small 前三个 Stage ----------
 class VPH_Light(nn.Module):
-    """视觉感知头：mobilenet_v3_small 前三个 Stage 的多尺度特征。"""
-
-    # 取 features 中索引 1, 4, 9 对应 16ch@128, 40ch@32, 96ch@16
     STAGE_INDICES = (1, 4, 9)
 
     def __init__(self, pretrained: bool = False):
         super().__init__()
-        backbone = tv_models.mobilenet_v3_small(weights="IMAGENET1K_V1" if pretrained else None)
+        backbone = tv_models.mobilenet_v3_small(
+            weights="IMAGENET1K_V1" if pretrained else None)
         self.features = backbone.features
         self._stage_indices = list(self.STAGE_INDICES)
-        self._out_channels: List[int] = [16, 40, 96]  # 与 STAGE_INDICES 对应
+        self._out_channels: List[int] = [16, 40, 96]
 
     @property
     def out_channels(self) -> List[int]:
@@ -96,11 +90,8 @@ class VPH_Light(nn.Module):
         return outs
 
 
-# ---------- FPH_Light: DCT + qtable 嵌入 + 深度可分离卷积，输出 64/128 ----------
 class FPH_Light(nn.Module):
-    """频率感知头：保留 FPH 的 DCT/量化表嵌入，轻量化 backbone 为深度可分离卷积，输出 64 或 128 通道。"""
-
-    def __init__(self, out_channels: int = 128):
+    def __init__(self, out_channels: int = 64):
         super().__init__()
         self.obembed = nn.Embedding(21, 21)
         nn.init.eye_(self.obembed.weight)
@@ -116,12 +107,11 @@ class FPH_Light(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.addcoords = AddCoords()
-        # 35 = 16 + 2 + 2 + 1 (coords) + 16 (DCT) -> 轻量 backbone 用深度可分离卷积
+        # 35 = 16*2 + 3(coords) → 8x8 stride 下采样 + 2 层 DSConv
         self.conv0 = nn.Sequential(
             nn.Conv2d(35, 64, kernel_size=8, stride=8, padding=0, bias=False),
             nn.BatchNorm2d(64, momentum=0.01),
             nn.ReLU(inplace=True),
-            DepthwiseSeparableConv2d(64, 64, 3),
             DepthwiseSeparableConv2d(64, 64, 3),
             DepthwiseSeparableConv2d(64, out_channels, 3),
         )
@@ -132,7 +122,6 @@ class FPH_Light(nn.Module):
         return self._out_channels
 
     def forward(self, x: torch.Tensor, qtable: torch.Tensor) -> torch.Tensor:
-        # x: (B, H, W) DCT 系数 0-20，与 fph 一致
         if x.dtype != torch.long:
             x = x.clamp(0, 20).long()
         x = self.conv2(self.conv1(self.obembed(x).permute(0, 3, 1, 2).contiguous()))
@@ -149,7 +138,6 @@ class FPH_Light(nn.Module):
         return self.conv0(self.addcoords(fused))
 
 
-# ---------- 特征对齐层：学生融合通道 -> 教师融合通道 192 ----------
 class AdaptationLayer(nn.Module):
     def __init__(self, in_channels: int, out_channels: int = TEACHER_FUSION_CHANNELS):
         super().__init__()
@@ -159,67 +147,58 @@ class AdaptationLayer(nn.Module):
         return self.conv(x)
 
 
-# ---------- Decoder_Light: 轻量 FPN / 简化 U-Net，输出单通道 ----------
 class Decoder_Light(nn.Module):
-    """多尺度特征 (c1, c2, c3) + 融合特征 fused -> 上采样融合 -> 单通道 Mask。"""
+    """增强型 FPN 解码器：DSConv + LightSCSE 注意力。"""
 
     def __init__(
         self,
         encoder_channels: List[int],
         fused_channels: int = TEACHER_FUSION_CHANNELS,
-        decoder_channels: Tuple[int, ...] = (64, 32, 16),
+        decoder_channels: Tuple[int, ...] = (128, 64, 32),
         out_channels: int = 1,
     ):
         super().__init__()
-        self.encoder_channels = encoder_channels
-        self.fused_channels = fused_channels
-        self.decoder_channels = list(decoder_channels)
-        # c3 与 fused 在同一尺度 (最小)，先合并
-        self.latent_ch = self.decoder_channels[0]
-        self.reduce_c3 = nn.Conv2d(encoder_channels[2] + fused_channels, self.latent_ch, 1)
-        self.reduce_c2 = nn.Conv2d(encoder_channels[1], self.decoder_channels[1], 1)
-        self.reduce_c1 = nn.Conv2d(encoder_channels[0], self.decoder_channels[2], 1)
-        self.up_conv2 = nn.Sequential(
-            nn.Conv2d(self.latent_ch + self.decoder_channels[1], self.decoder_channels[1], 3, padding=1),
-            nn.BatchNorm2d(self.decoder_channels[1]),
+        # c3 + fused → reduce
+        self.reduce_c3 = nn.Sequential(
+            nn.Conv2d(encoder_channels[2] + fused_channels, decoder_channels[0], 1, bias=False),
+            nn.BatchNorm2d(decoder_channels[0]),
             nn.ReLU(inplace=True),
         )
-        self.up_conv1 = nn.Sequential(
-            nn.Conv2d(self.decoder_channels[1] + self.decoder_channels[2], self.decoder_channels[2], 3, padding=1),
-            nn.BatchNorm2d(self.decoder_channels[2]),
-            nn.ReLU(inplace=True),
+        # stage 2: upsample + concat c2
+        self.reduce_c2 = nn.Conv2d(encoder_channels[1], decoder_channels[1], 1, bias=False)
+        self.up_block2 = nn.Sequential(
+            DepthwiseSeparableConv2d(decoder_channels[0] + decoder_channels[1], decoder_channels[1]),
+            LightSCSE(decoder_channels[1]),
         )
-        self.head = nn.Conv2d(self.decoder_channels[2], out_channels, 1)
+        # stage 1: upsample + concat c1
+        self.reduce_c1 = nn.Conv2d(encoder_channels[0], decoder_channels[2], 1, bias=False)
+        self.up_block1 = nn.Sequential(
+            DepthwiseSeparableConv2d(decoder_channels[1] + decoder_channels[2], decoder_channels[2]),
+            LightSCSE(decoder_channels[2]),
+        )
+        self.head = nn.Conv2d(decoder_channels[2], out_channels, 1)
 
-    def forward(
-        self,
-        feats: List[torch.Tensor],
-        fused: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, feats: List[torch.Tensor], fused: torch.Tensor) -> torch.Tensor:
         c1, c2, c3 = feats[0], feats[1], feats[2]
-        # fused 与 c3 同尺度 (16x16)
         if fused.shape[2:] != c3.shape[2:]:
             fused = F.interpolate(fused, size=c3.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([c3, fused], dim=1)
-        x = self.reduce_c3(x)
+        x = self.reduce_c3(torch.cat([c3, fused], dim=1))
+
         c2_r = self.reduce_c2(c2)
-        c1_r = self.reduce_c1(c1)
         x = F.interpolate(x, size=c2.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, c2_r], dim=1)
-        x = self.up_conv2(x)
+        x = self.up_block2(torch.cat([x, c2_r], dim=1))
+
+        c1_r = self.reduce_c1(c1)
         x = F.interpolate(x, size=c1.shape[2:], mode="bilinear", align_corners=False)
-        x = torch.cat([x, c1_r], dim=1)
-        x = self.up_conv1(x)
+        x = self.up_block1(torch.cat([x, c1_r], dim=1))
+
         return self.head(x)
 
 
-# ---------- LightDTD ----------
 class LightDTD(nn.Module):
-    """轻量化学生网络：VPH_Light + FPH_Light + 融合 + Adaptation + Decoder_Light。"""
-
     def __init__(
         self,
-        fph_out_channels: int = 128,
+        fph_out_channels: int = 64,
         teacher_fusion_channels: int = TEACHER_FUSION_CHANNELS,
         pretrained_vph: bool = False,
         classes: int = 1,
@@ -227,20 +206,17 @@ class LightDTD(nn.Module):
         super().__init__()
         self.vph = VPH_Light(pretrained=pretrained_vph)
         self.fph = FPH_Light(out_channels=fph_out_channels)
-        # 融合：取第三阶段特征 (96ch) 与 FPH 输出拼接
-        visual_ch = self.vph.out_channels[-1]
-        fused_ch = visual_ch + self.fph.out_channels
+        visual_ch = self.vph.out_channels[-1]  # 96
+        fused_ch = visual_ch + self.fph.out_channels  # 96 + 64 = 160
         self.fuse_conv = nn.Sequential(
             LightSCSE(fused_ch, reduction=8),
-            nn.Conv2d(fused_ch, fused_ch, 3, padding=1),
-            nn.BatchNorm2d(fused_ch),
-            nn.ReLU(inplace=True),
+            DepthwiseSeparableConv2d(fused_ch, fused_ch, 3),
         )
         self.adapt_layer = AdaptationLayer(fused_ch, teacher_fusion_channels)
         self.decoder = Decoder_Light(
             encoder_channels=self.vph.out_channels,
             fused_channels=teacher_fusion_channels,
-            decoder_channels=(64, 32, 16),
+            decoder_channels=(128, 64, 32),
             out_channels=classes,
         )
 
@@ -264,7 +240,6 @@ class LightDTD(nn.Module):
         return logits
 
     def get_adapted_fusion(self, x: torch.Tensor, dct: torch.Tensor, qt: torch.Tensor) -> torch.Tensor:
-        """返回对齐到教师通道的融合特征，用于蒸馏."""
         visual_feats = self.vph(x)
         fph_out = self.fph(dct, qt)
         c3 = visual_feats[2]
