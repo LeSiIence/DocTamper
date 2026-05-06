@@ -39,12 +39,17 @@ class TamperDataset(Dataset):
 
     def __init__(self, roots, minq=75, max_readers=64, dataset_name=None,
                  base_dir=None):
-        self.envs = lmdb.open(roots, max_readers=max_readers, readonly=True,
-                              lock=False, readahead=False, meminit=False)
-        with self.envs.begin(write=False) as txn:
-            self.nSamples = int(txn.get('num-samples'.encode('utf-8')))
-        self.max_nums = self.nSamples
+        self._roots = roots
+        self._max_readers = max_readers
+        self.envs = None  # lazy open per worker
         self.minq = minq
+
+        env = lmdb.open(roots, max_readers=max_readers, readonly=True,
+                        lock=False, readahead=False, meminit=False)
+        with env.begin(write=False) as txn:
+            self.nSamples = int(txn.get('num-samples'.encode('utf-8')))
+        env.close()
+        self.max_nums = self.nSamples
 
         if base_dir is None:
             base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -65,10 +70,22 @@ class TamperDataset(Dataset):
                 mean=(0.485, 0.455, 0.406), std=(0.229, 0.224, 0.225)),
         ])
 
+    def _ensure_env(self):
+        if self.envs is None:
+            self.envs = lmdb.open(
+                self._roots, max_readers=self._max_readers, readonly=True,
+                lock=False, readahead=False, meminit=False)
+
+    def close(self):
+        if self.envs is not None:
+            self.envs.close()
+            self.envs = None
+
     def __len__(self):
         return self.max_nums
 
     def __getitem__(self, index):
+        self._ensure_env()
         with self.envs.begin(write=False) as txn:
             imgbuf = txn.get(f'image-{index:09d}'.encode())
             lblbuf = txn.get(f'label-{index:09d}'.encode())
@@ -224,11 +241,13 @@ def setup_logging(log_dir):
 
 @torch.no_grad()
 def evaluate(student, dataset_name, lmdb_path, minq, device, batch_size=6,
-             num_workers=4, base_dir=None):
+             num_workers=2, base_dir=None):
+    import gc
     test_ds = TamperDataset(lmdb_path, minq=minq, dataset_name=dataset_name,
                             base_dir=base_dir)
     loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=True)
+                        num_workers=num_workers, pin_memory=False,
+                        persistent_workers=False)
     student.eval()
     iou_metric = IOUMetric(2)
     precisions, recalls = [], []
@@ -240,18 +259,25 @@ def evaluate(student, dataset_name, lmdb_path, minq, device, batch_size=6,
         qs = batch['q'].to(device, non_blocking=True).view(img.size(0), -1).long()
 
         pred = student(img, dct, qs)
-        predt = pred.argmax(1)
+        pred_cls = pred.argmax(1)
         targt = target.squeeze(1)
-        matched = (predt * targt).sum((1, 2))
-        precisions.append((matched / (predt.sum((1, 2)) + 1e-8)).mean().item())
+        matched = (pred_cls * targt).sum((1, 2))
+        precisions.append((matched / (pred_cls.sum((1, 2)) + 1e-8)).mean().item())
         recalls.append((matched / (targt.sum((1, 2)) + 1e-8)).mean().item())
-        iou_metric.add_batch(
-            pred.argmax(1).cpu().numpy(), target.cpu().numpy())
+        iou_metric.add_batch(pred_cls.cpu().numpy(), target.cpu().numpy())
+        del img, target, dct, qs, pred, pred_cls, targt, matched
 
     acc, iu, mean_iu = iou_metric.evaluate()
     prec = np.mean(precisions)
     rec = np.mean(recalls)
     f1 = 2 * prec * rec / (prec + rec + 1e-8)
+
+    del loader
+    test_ds.close()
+    del test_ds
+    gc.collect()
+    torch.cuda.empty_cache()
+
     student.train()
     return {
         'dataset': dataset_name,
@@ -280,6 +306,10 @@ def parse_args():
     p.add_argument('--eval_batch_size', type=int, default=6)
     p.add_argument('--num_workers', type=int, default=8)
     p.add_argument('--lr', type=float, default=1e-4)
+    p.add_argument('--eta_min', type=float, default=0.0,
+                   help='CosineAnnealingLR 最低 lr，0 表示不使用 scheduler')
+    p.add_argument('--weight_decay', type=float, default=0.0,
+                   help='AdamW weight decay，>0 时使用 AdamW 替代 Adam')
     p.add_argument('--alpha', type=float, default=1.0)
     p.add_argument('--beta', type=float, default=1.0)
     p.add_argument('--gamma', type=float, default=0.01)
@@ -289,6 +319,8 @@ def parse_args():
     p.add_argument('--log_dir', type=str, default='logs')
     p.add_argument('--resume', type=str, default='',
                    help='checkpoint 路径，留空则自动检测 latest.pth')
+    p.add_argument('--reset_optimizer', action='store_true',
+                   help='加载权重但重置 optimizer/scheduler/epoch（用于二阶段微调）')
     return p.parse_args()
 
 
@@ -415,26 +447,37 @@ def train_one_epoch(epoch, teacher, student, dataloader, criterion, optimizer,
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(path, epoch, student, optimizer, scaler, best_iou):
-    torch.save({
+def save_checkpoint(path, epoch, student, optimizer, scaler, best_iou,
+                    scheduler=None):
+    state = {
         'epoch': epoch,
         'student_state': _student_state(student),
         'optimizer': optimizer.state_dict(),
         'scaler': scaler.state_dict(),
         'best_iou': best_iou,
-    }, path)
+    }
+    if scheduler is not None:
+        state['scheduler'] = scheduler.state_dict()
+    torch.save(state, path)
 
 
-def load_checkpoint(path, student, optimizer, scaler):
+def load_checkpoint(path, student, optimizer, scaler, scheduler=None,
+                    reset_optimizer=False):
     ckpt = torch.load(path, map_location='cpu')
     raw = ckpt.get('student_state', ckpt.get('state_dict'))
     if raw is None:
         raise KeyError(f"Checkpoint lacks student_state/state_dict: {path}")
     _load_student_state_dict(student, raw)
+
+    if reset_optimizer:
+        return 0, float(ckpt.get('best_iou', 0.0))
+
     if 'optimizer' in ckpt:
         optimizer.load_state_dict(ckpt['optimizer'])
     if 'scaler' in ckpt:
         scaler.load_state_dict(ckpt['scaler'])
+    if scheduler is not None and 'scheduler' in ckpt:
+        scheduler.load_state_dict(ckpt['scheduler'])
     return int(ckpt.get('epoch', 0)), float(ckpt.get('best_iou', 0.0))
 
 
@@ -477,9 +520,21 @@ def main():
     # ---- model ----
     teacher, student, device = build_models(args)
     criterion = build_criterion(args).to(device)
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, student.parameters()), lr=args.lr)
+
+    trainable = filter(lambda p: p.requires_grad, student.parameters())
+    if args.weight_decay > 0:
+        optimizer = torch.optim.AdamW(trainable, lr=args.lr,
+                                      weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.Adam(trainable, lr=args.lr)
+
     scaler = GradScaler()
+
+    scheduler = None
+    if args.eta_min > 0:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.eta_min)
+
     start_epoch = 1
     best_iou = 0.0
 
@@ -491,25 +546,39 @@ def main():
             resume_path = auto
     if resume_path and os.path.isfile(resume_path):
         prev_epoch, best_iou = load_checkpoint(
-            resume_path, student, optimizer, scaler)
+            resume_path, student, optimizer, scaler, scheduler,
+            reset_optimizer=args.reset_optimizer)
         start_epoch = prev_epoch + 1
-        logger.info(f'Resumed from {resume_path}, epoch {prev_epoch}, '
-                     f'best_iou {best_iou:.4f}')
+        if args.reset_optimizer:
+            start_epoch = 1
+            best_iou = 0.0
+            logger.info(f'Loaded weights from {resume_path}, '
+                         f'optimizer/scheduler/epoch reset for fine-tuning')
+        else:
+            logger.info(f'Resumed from {resume_path}, epoch {prev_epoch}, '
+                         f'best_iou {best_iou:.4f}')
 
     total_params = sum(p.numel() for p in student.parameters())
     logger.info(f'Student params: {total_params:,}')
     logger.info(f'Training {args.epochs} epochs, start={start_epoch}')
+    if scheduler:
+        logger.info(f'Scheduler: CosineAnnealingLR, '
+                     f'lr={args.lr} -> eta_min={args.eta_min}')
 
     # ---- train loop ----
     for epoch in range(start_epoch, args.epochs + 1):
+        cur_lr = optimizer.param_groups[0]['lr']
         t0 = time.time()
         train_metrics = train_one_epoch(
             epoch, teacher, student, train_loader, criterion, optimizer,
             scaler, device)
         train_time = time.time() - t0
 
+        if scheduler:
+            scheduler.step()
+
         logger.info(
-            f'Epoch {epoch}/{args.epochs} [{train_time:.0f}s] '
+            f'Epoch {epoch}/{args.epochs} [{train_time:.0f}s] lr={cur_lr:.2e} '
             f'loss={train_metrics["loss"]:.4f} hard={train_metrics["hard"]:.4f} '
             f'soft={train_metrics["soft"]:.4f} feat={train_metrics["feat"]:.4f}')
 
@@ -518,7 +587,7 @@ def main():
         for ds_name, ds_path in eval_sets:
             res = evaluate(
                 student, ds_name, ds_path, args.minq, device,
-                batch_size=args.eval_batch_size, num_workers=args.num_workers,
+                batch_size=args.eval_batch_size, num_workers=2,
                 base_dir=base_dir)
             eval_results[ds_name] = res
             logger.info(
@@ -530,6 +599,7 @@ def main():
         # ---- metrics jsonl ----
         record = {
             'epoch': epoch,
+            'lr': cur_lr,
             'train': train_metrics,
             'eval': eval_results,
             'time_s': train_time,
@@ -543,19 +613,19 @@ def main():
             best_iou = cur_iou
             save_checkpoint(
                 os.path.join(args.save_dir, 'best.pth'),
-                epoch, student, optimizer, scaler, best_iou)
+                epoch, student, optimizer, scaler, best_iou, scheduler)
             logger.info(f'  New best mIoU={best_iou:.4f}, saved best.pth')
 
         # ---- checkpoint: latest (every epoch, after best_iou updated) ----
         save_checkpoint(
             os.path.join(args.save_dir, 'latest.pth'),
-            epoch, student, optimizer, scaler, best_iou)
+            epoch, student, optimizer, scaler, best_iou, scheduler)
 
         # ---- checkpoint: periodic ----
         if epoch % args.save_interval == 0:
             save_checkpoint(
                 os.path.join(args.save_dir, f'epoch_{epoch}.pth'),
-                epoch, student, optimizer, scaler, best_iou)
+                epoch, student, optimizer, scaler, best_iou, scheduler)
             logger.info(f'  Saved epoch_{epoch}.pth')
 
     logger.info(f'Training finished. Best TestingSet mIoU={best_iou:.4f}')
